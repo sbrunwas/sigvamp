@@ -15,8 +15,16 @@ MIDI_PORT_NAME = "Arturia MiniLab mkII MIDI 1"
 START_CC = 112
 END_CC = 114
 VOLUME_CC = 74
+ATTACK_CC = 18
+DECAY_CC = 19
 
 ROOT_NOTE = 60
+
+ATTACK_SENSITIVITY = 0.5
+DECAY_SENSITIVITY = 2.0
+
+DEFAULT_ATTACK_MS = 5.0
+DEFAULT_DECAY_MS = 20.0
 
 # ---------------------------------
 # RECORD AUDIO
@@ -47,6 +55,9 @@ loop_end = 1.0
 # Slightly hotter default level
 master_gain = 1.5
 
+attack_ms = DEFAULT_ATTACK_MS
+decay_ms = DEFAULT_DECAY_MS
+
 # ---------------------------------
 # MIDI HELPERS
 # ---------------------------------
@@ -57,6 +68,41 @@ def cc_relative_delta(value):
         return 0
 
     return value - 64
+
+
+def apply_envelope(buffer, attack_ms, decay_ms):
+
+    shaped = buffer.copy()
+    total_frames = len(shaped)
+
+    if total_frames == 0:
+        return shaped
+
+    attack_frames = int((attack_ms / 1000) * SAMPLERATE)
+    decay_frames = int((decay_ms / 1000) * SAMPLERATE)
+
+    attack_frames = min(attack_frames, total_frames)
+    decay_frames = min(decay_frames, total_frames)
+
+    if attack_frames > 1:
+        attack = np.linspace(
+            0.0,
+            1.0,
+            attack_frames,
+            dtype=np.float32
+        )
+        shaped[:attack_frames] *= attack[:, None]
+
+    if decay_frames > 1:
+        decay = np.linspace(
+            1.0,
+            0.0,
+            decay_frames,
+            dtype=np.float32
+        )
+        shaped[-decay_frames:] *= decay[:, None]
+
+    return shaped
 
 # ---------------------------------
 # MIDI LOOP
@@ -69,6 +115,8 @@ with mido.open_input(MIDI_PORT_NAME) as port:
     print("Knob 1 = loop start")
     print("Knob 2 = loop end")
     print("Knob 3 = gain")
+    print("CC18 = attack")
+    print("CC19 = decay")
 
     for msg in port:
 
@@ -122,6 +170,16 @@ with mido.open_input(MIDI_PORT_NAME) as port:
 
             pitched = pitched * master_gain
 
+            # ---------------------------------
+            # APPLY ENVELOPE
+            # ---------------------------------
+
+            pitched = apply_envelope(
+                pitched,
+                attack_ms,
+                decay_ms
+            )
+
             # Prevent clipping
             pitched = np.clip(
                 pitched,
@@ -163,7 +221,7 @@ with mido.open_input(MIDI_PORT_NAME) as port:
             # LOOP END
             elif msg.control == END_CC:
 
-                loop_end += delta * 0.01
+                loop_end += delta * 0.002
 
                 loop_end = float(
                     np.clip(
@@ -176,13 +234,39 @@ with mido.open_input(MIDI_PORT_NAME) as port:
             # GAIN
             elif msg.control == VOLUME_CC:
 
-                master_gain += delta * 0.05
+                master_gain += delta * 0.01
 
                 master_gain = float(
                     np.clip(
                         master_gain,
                         0.0,
                         4.0
+                    )
+                )
+
+            # ATTACK
+            elif msg.control == ATTACK_CC:
+
+                attack_ms += delta * ATTACK_SENSITIVITY
+
+                attack_ms = float(
+                    np.clip(
+                        attack_ms,
+                        0.0,
+                        500.0
+                    )
+                )
+
+            # DECAY
+            elif msg.control == DECAY_CC:
+
+                decay_ms += delta * DECAY_SENSITIVITY
+
+                decay_ms = float(
+                    np.clip(
+                        decay_ms,
+                        0.0,
+                        2000.0
                     )
                 )
 
@@ -193,5 +277,7 @@ with mido.open_input(MIDI_PORT_NAME) as port:
             print(
                 f"START={loop_start:.3f} "
                 f"END={loop_end:.3f} "
-                f"GAIN={master_gain:.2f}"
+                f"GAIN={master_gain:.2f} "
+                f"ATTACK={attack_ms:.1f}ms "
+                f"DECAY={decay_ms:.1f}ms"
             )
