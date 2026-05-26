@@ -22,13 +22,20 @@ RELEASE_CC = 19
 ALT_RELEASE_CC = 16
 
 ROOT_NOTE = 60
+ROOT_FREQUENCY = 440.0 * (2 ** ((ROOT_NOTE - 69) / 12))
+AUTO_ROOT_DETECTION = True
 
 MAX_VOICES = 6
 BLOCKSIZE = 512
 
-GRAIN_SIZE = 2048
-GRAIN_HOP = 512
-GRAIN_LEVEL = 0.5
+GRAIN_SIZE = 1024
+GRAIN_HOP = 256
+GRAIN_LEVEL = 0.32
+GRAIN_SOURCE_JITTER_MS = 5.0
+GRAIN_TIMING_JITTER_SAMPLES = 32
+GRAIN_PITCH_JITTER_CENTS = 3.0
+
+WARM_LOWPASS_ALPHA = 0.35
 
 ATTACK_SENSITIVITY = 0.5
 RELEASE_SENSITIVITY = 2.0
@@ -56,6 +63,121 @@ print("Recording complete.")
 print("Skipping normalization.")
 
 # ---------------------------------
+# AUTO ROOT DETECTION
+# ---------------------------------
+
+
+def midi_note_name(note):
+
+    names = [
+        "C",
+        "C#",
+        "D",
+        "D#",
+        "E",
+        "F",
+        "F#",
+        "G",
+        "G#",
+        "A",
+        "A#",
+        "B"
+    ]
+
+    octave = (note // 12) - 1
+
+    return f"{names[note % 12]}{octave}"
+
+
+def frequency_to_midi(frequency):
+
+    return 69 + (12 * np.log2(frequency / 440.0))
+
+
+def detect_fundamental(buffer, samplerate, min_freq=50, max_freq=1000):
+
+    mono = buffer.mean(axis=1)
+    mono = mono - np.mean(mono)
+
+    max_frames = samplerate
+
+    if len(mono) > max_frames:
+        start = (len(mono) - max_frames) // 2
+        mono = mono[start:start + max_frames]
+
+    rms = np.sqrt(np.mean(mono * mono))
+
+    if rms < 0.001:
+        return None, 0.0
+
+    mono = mono / rms
+    mono = mono * np.hanning(len(mono))
+
+    fft_size = 1
+
+    while fft_size < len(mono) * 2:
+        fft_size *= 2
+
+    spectrum = np.fft.rfft(mono, fft_size)
+    autocorr = np.fft.irfft(
+        spectrum * np.conj(spectrum)
+    )[:len(mono)]
+
+    min_lag = int(samplerate / max_freq)
+    max_lag = int(samplerate / min_freq)
+    max_lag = min(max_lag, len(autocorr) - 1)
+
+    if max_lag <= min_lag:
+        return None, 0.0
+
+    search = autocorr[min_lag:max_lag]
+    peak = int(np.argmax(search)) + min_lag
+    confidence = float(autocorr[peak] / autocorr[0])
+
+    if confidence < 0.1:
+        return None, confidence
+
+    if 1 <= peak < len(autocorr) - 1:
+        left = autocorr[peak - 1]
+        center = autocorr[peak]
+        right = autocorr[peak + 1]
+        denominator = left - (2 * center) + right
+
+        if denominator != 0:
+            peak = peak + (0.5 * (left - right) / denominator)
+
+    frequency = samplerate / peak
+
+    return float(frequency), confidence
+
+
+pitch_correction = 1.0
+
+if AUTO_ROOT_DETECTION:
+    detected_frequency, pitch_confidence = detect_fundamental(
+        audio,
+        SAMPLERATE
+    )
+
+    if detected_frequency is None:
+        print("Auto-root detection failed; assuming sample root is C.")
+    else:
+        detected_midi = frequency_to_midi(detected_frequency)
+        nearest_midi = int(round(detected_midi))
+        cents = (detected_midi - nearest_midi) * 100
+        pitch_correction = ROOT_FREQUENCY / detected_frequency
+
+        print(
+            "Auto-root: "
+            f"{detected_frequency:.1f} Hz "
+            f"({midi_note_name(nearest_midi)} {cents:+.0f} cents, "
+            f"confidence={pitch_confidence:.2f})"
+        )
+        print(
+            f"Pitch correction for C root: {pitch_correction:.3f}x"
+        )
+
+# ---------------------------------
 # PLAYBACK STATE
 # ---------------------------------
 
@@ -68,6 +190,8 @@ attack_ms = DEFAULT_ATTACK_MS
 release_ms = DEFAULT_RELEASE_MS
 
 grain_window = np.hanning(GRAIN_SIZE).astype(np.float32)
+source_jitter_samples = int((GRAIN_SOURCE_JITTER_MS / 1000) * SAMPLERATE)
+lowpass_state = np.zeros(2, dtype=np.float32)
 
 voices = []
 voices_lock = threading.Lock()
@@ -105,10 +229,25 @@ def read_interpolated(segment, positions):
     )
 
 
+def cents_to_ratio(cents):
+
+    return 2 ** (cents / 1200)
+
+
 def make_grain(segment, source_start, pitch_ratio):
 
-    source_positions = source_start + (
-        np.arange(GRAIN_SIZE, dtype=np.float32) * pitch_ratio
+    source_jitter = np.random.randint(
+        -source_jitter_samples,
+        source_jitter_samples + 1
+    )
+    pitch_jitter = np.random.uniform(
+        -GRAIN_PITCH_JITTER_CENTS,
+        GRAIN_PITCH_JITTER_CENTS
+    )
+    grain_pitch_ratio = pitch_ratio * cents_to_ratio(pitch_jitter)
+
+    source_positions = source_start + source_jitter + (
+        np.arange(GRAIN_SIZE, dtype=np.float32) * grain_pitch_ratio
     )
 
     grain = read_interpolated(
@@ -132,7 +271,7 @@ def build_voice(note):
     segment = audio[start_idx:end_idx].copy()
 
     semitones = note - ROOT_NOTE
-    pitch_ratio = 2 ** (semitones / 12)
+    pitch_ratio = pitch_correction * (2 ** (semitones / 12))
 
     attack_frames = int((attack_ms / 1000) * SAMPLERATE)
     release_frames = int((release_ms / 1000) * SAMPLERATE)
@@ -188,7 +327,12 @@ def schedule_grains(voice, frames):
         voice["grains"].append({
             "buffer": grain,
             "position": 0,
-            "offset": int(countdown)
+            "offset": int(
+                countdown + np.random.randint(
+                    -GRAIN_TIMING_JITTER_SAMPLES,
+                    GRAIN_TIMING_JITTER_SAMPLES + 1
+                )
+            )
         })
 
         countdown += GRAIN_HOP
@@ -325,6 +469,19 @@ def render_granular_voice(voice, frames):
     return block * master_gain, is_active
 
 
+def apply_warm_lowpass(buffer):
+
+    global lowpass_state
+
+    for i in range(len(buffer)):
+        lowpass_state += WARM_LOWPASS_ALPHA * (
+            buffer[i] - lowpass_state
+        )
+        buffer[i] = lowpass_state
+
+    return buffer
+
+
 # ---------------------------------
 # AUDIO CALLBACK
 # ---------------------------------
@@ -351,6 +508,8 @@ def audio_callback(outdata, frames, time, status):
                 active_voices.append(voice)
 
         voices[:] = active_voices
+
+    apply_warm_lowpass(outdata)
 
     np.clip(
         outdata,

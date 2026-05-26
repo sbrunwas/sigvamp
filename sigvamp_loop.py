@@ -22,6 +22,8 @@ RELEASE_CC = 19
 ALT_RELEASE_CC = 16
 
 ROOT_NOTE = 60
+ROOT_FREQUENCY = 440.0 * (2 ** ((ROOT_NOTE - 69) / 12))
+AUTO_ROOT_DETECTION = True
 
 MAX_VOICES = 8
 BLOCKSIZE = 512
@@ -50,6 +52,121 @@ sd.wait()
 
 print("Recording complete.")
 print("Skipping normalization.")
+
+# ---------------------------------
+# AUTO ROOT DETECTION
+# ---------------------------------
+
+
+def midi_note_name(note):
+
+    names = [
+        "C",
+        "C#",
+        "D",
+        "D#",
+        "E",
+        "F",
+        "F#",
+        "G",
+        "G#",
+        "A",
+        "A#",
+        "B"
+    ]
+
+    octave = (note // 12) - 1
+
+    return f"{names[note % 12]}{octave}"
+
+
+def frequency_to_midi(frequency):
+
+    return 69 + (12 * np.log2(frequency / 440.0))
+
+
+def detect_fundamental(buffer, samplerate, min_freq=50, max_freq=1000):
+
+    mono = buffer.mean(axis=1)
+    mono = mono - np.mean(mono)
+
+    max_frames = samplerate
+
+    if len(mono) > max_frames:
+        start = (len(mono) - max_frames) // 2
+        mono = mono[start:start + max_frames]
+
+    rms = np.sqrt(np.mean(mono * mono))
+
+    if rms < 0.001:
+        return None, 0.0
+
+    mono = mono / rms
+    mono = mono * np.hanning(len(mono))
+
+    fft_size = 1
+
+    while fft_size < len(mono) * 2:
+        fft_size *= 2
+
+    spectrum = np.fft.rfft(mono, fft_size)
+    autocorr = np.fft.irfft(
+        spectrum * np.conj(spectrum)
+    )[:len(mono)]
+
+    min_lag = int(samplerate / max_freq)
+    max_lag = int(samplerate / min_freq)
+    max_lag = min(max_lag, len(autocorr) - 1)
+
+    if max_lag <= min_lag:
+        return None, 0.0
+
+    search = autocorr[min_lag:max_lag]
+    peak = int(np.argmax(search)) + min_lag
+    confidence = float(autocorr[peak] / autocorr[0])
+
+    if confidence < 0.1:
+        return None, confidence
+
+    if 1 <= peak < len(autocorr) - 1:
+        left = autocorr[peak - 1]
+        center = autocorr[peak]
+        right = autocorr[peak + 1]
+        denominator = left - (2 * center) + right
+
+        if denominator != 0:
+            peak = peak + (0.5 * (left - right) / denominator)
+
+    frequency = samplerate / peak
+
+    return float(frequency), confidence
+
+
+pitch_correction = 1.0
+
+if AUTO_ROOT_DETECTION:
+    detected_frequency, pitch_confidence = detect_fundamental(
+        audio,
+        SAMPLERATE
+    )
+
+    if detected_frequency is None:
+        print("Auto-root detection failed; assuming sample root is C.")
+    else:
+        detected_midi = frequency_to_midi(detected_frequency)
+        nearest_midi = int(round(detected_midi))
+        cents = (detected_midi - nearest_midi) * 100
+        pitch_correction = ROOT_FREQUENCY / detected_frequency
+
+        print(
+            "Auto-root: "
+            f"{detected_frequency:.1f} Hz "
+            f"({midi_note_name(nearest_midi)} {cents:+.0f} cents, "
+            f"confidence={pitch_confidence:.2f})"
+        )
+        print(
+            f"Pitch correction for C root: {pitch_correction:.3f}x"
+        )
 
 # ---------------------------------
 # PLAYBACK STATE
@@ -94,7 +211,7 @@ def build_voice(note):
     sample = audio[start_idx:end_idx]
 
     semitones = note - ROOT_NOTE
-    speed = 2 ** (semitones / 12)
+    speed = pitch_correction * (2 ** (semitones / 12))
 
     indices = np.arange(
         0,
