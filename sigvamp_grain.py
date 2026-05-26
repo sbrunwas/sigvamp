@@ -25,16 +25,16 @@ ROOT_NOTE = 60
 ROOT_FREQUENCY = 440.0 * (2 ** ((ROOT_NOTE - 69) / 12))
 AUTO_ROOT_DETECTION = True
 
-MAX_VOICES = 4
-BLOCKSIZE = 512
+MAX_VOICES = 3
+BLOCKSIZE = 1024
 
-GRAIN_SIZE = 1536
-GRAIN_HOP = 512
-GRAIN_LEVEL = 0.4
-GRAIN_SOURCE_JITTER_MS = 3.0
-GRAIN_PITCH_JITTER_CENTS = 2.0
+GRAIN_SIZE = 1024
+GRAIN_HOP = 768
+GRAIN_LEVEL = 0.55
+GRAIN_SOURCE_JITTER_MS = 1.0
+GRAIN_PITCH_JITTER_CENTS = 0.0
 
-WARM_SMOOTH_MIX = 0.25
+WARM_SMOOTH_MIX = 0.15
 
 ATTACK_SENSITIVITY = 0.5
 RELEASE_SENSITIVITY = 2.0
@@ -189,6 +189,7 @@ attack_ms = DEFAULT_ATTACK_MS
 release_ms = DEFAULT_RELEASE_MS
 
 grain_window = np.hanning(GRAIN_SIZE).astype(np.float32)
+grain_positions = np.arange(GRAIN_SIZE, dtype=np.float32)
 source_jitter_samples = int((GRAIN_SOURCE_JITTER_MS / 1000) * SAMPLERATE)
 tone_previous = np.zeros(2, dtype=np.float32)
 
@@ -236,18 +237,25 @@ def cents_to_ratio(cents):
 
 def make_grain(segment, source_start, pitch_ratio):
 
-    source_jitter = np.random.randint(
-        -source_jitter_samples,
-        source_jitter_samples + 1
-    )
-    pitch_jitter = np.random.uniform(
-        -GRAIN_PITCH_JITTER_CENTS,
-        GRAIN_PITCH_JITTER_CENTS
-    )
-    grain_pitch_ratio = pitch_ratio * cents_to_ratio(pitch_jitter)
+    source_jitter = 0
+
+    if source_jitter_samples > 0:
+        source_jitter = np.random.randint(
+            -source_jitter_samples,
+            source_jitter_samples + 1
+        )
+
+    grain_pitch_ratio = pitch_ratio
+
+    if GRAIN_PITCH_JITTER_CENTS > 0:
+        pitch_jitter = np.random.uniform(
+            -GRAIN_PITCH_JITTER_CENTS,
+            GRAIN_PITCH_JITTER_CENTS
+        )
+        grain_pitch_ratio = pitch_ratio * cents_to_ratio(pitch_jitter)
 
     source_positions = source_start + source_jitter + (
-        np.arange(GRAIN_SIZE, dtype=np.float32) * grain_pitch_ratio
+        grain_positions * grain_pitch_ratio
     )
 
     grain = read_interpolated(
@@ -496,7 +504,7 @@ def audio_callback(outdata, frames, time, status):
     global callback_status_count
 
     if status and callback_status_count < 5:
-        print(status)
+        print(f"Audio callback status: {status}")
         callback_status_count += 1
 
     outdata.fill(0.0)
