@@ -25,17 +25,16 @@ ROOT_NOTE = 60
 ROOT_FREQUENCY = 440.0 * (2 ** ((ROOT_NOTE - 69) / 12))
 AUTO_ROOT_DETECTION = True
 
-MAX_VOICES = 6
+MAX_VOICES = 4
 BLOCKSIZE = 512
 
-GRAIN_SIZE = 1024
-GRAIN_HOP = 256
-GRAIN_LEVEL = 0.32
-GRAIN_SOURCE_JITTER_MS = 5.0
-GRAIN_TIMING_JITTER_SAMPLES = 32
-GRAIN_PITCH_JITTER_CENTS = 3.0
+GRAIN_SIZE = 1536
+GRAIN_HOP = 512
+GRAIN_LEVEL = 0.4
+GRAIN_SOURCE_JITTER_MS = 3.0
+GRAIN_PITCH_JITTER_CENTS = 2.0
 
-WARM_LOWPASS_ALPHA = 0.35
+WARM_SMOOTH_MIX = 0.25
 
 ATTACK_SENSITIVITY = 0.5
 RELEASE_SENSITIVITY = 2.0
@@ -191,10 +190,11 @@ release_ms = DEFAULT_RELEASE_MS
 
 grain_window = np.hanning(GRAIN_SIZE).astype(np.float32)
 source_jitter_samples = int((GRAIN_SOURCE_JITTER_MS / 1000) * SAMPLERATE)
-lowpass_state = np.zeros(2, dtype=np.float32)
+tone_previous = np.zeros(2, dtype=np.float32)
 
 voices = []
 voices_lock = threading.Lock()
+callback_status_count = 0
 
 # ---------------------------------
 # MIDI HELPERS
@@ -327,12 +327,7 @@ def schedule_grains(voice, frames):
         voice["grains"].append({
             "buffer": grain,
             "position": 0,
-            "offset": int(
-                countdown + np.random.randint(
-                    -GRAIN_TIMING_JITTER_SAMPLES,
-                    GRAIN_TIMING_JITTER_SAMPLES + 1
-                )
-            )
+            "offset": int(countdown)
         })
 
         countdown += GRAIN_HOP
@@ -469,15 +464,24 @@ def render_granular_voice(voice, frames):
     return block * master_gain, is_active
 
 
-def apply_warm_lowpass(buffer):
+def apply_warm_tone(buffer):
 
-    global lowpass_state
+    global tone_previous
 
-    for i in range(len(buffer)):
-        lowpass_state += WARM_LOWPASS_ALPHA * (
-            buffer[i] - lowpass_state
-        )
-        buffer[i] = lowpass_state
+    smoothed = np.empty_like(buffer)
+    smoothed[0] = 0.5 * (
+        buffer[0] + tone_previous
+    )
+    smoothed[1:] = 0.5 * (
+        buffer[1:] + buffer[:-1]
+    )
+
+    tone_previous = buffer[-1].copy()
+
+    buffer[:] = (
+        ((1.0 - WARM_SMOOTH_MIX) * buffer)
+        + (WARM_SMOOTH_MIX * smoothed)
+    )
 
     return buffer
 
@@ -489,8 +493,11 @@ def apply_warm_lowpass(buffer):
 
 def audio_callback(outdata, frames, time, status):
 
-    if status:
+    global callback_status_count
+
+    if status and callback_status_count < 5:
         print(status)
+        callback_status_count += 1
 
     outdata.fill(0.0)
 
@@ -509,7 +516,7 @@ def audio_callback(outdata, frames, time, status):
 
         voices[:] = active_voices
 
-    apply_warm_lowpass(outdata)
+    apply_warm_tone(outdata)
 
     np.clip(
         outdata,
